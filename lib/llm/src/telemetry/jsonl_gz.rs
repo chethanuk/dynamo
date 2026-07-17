@@ -1,22 +1,48 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Generic rotating gzip JSONL sink shared by audit and request trace.
+//! Generic rotating gzip JSONL sink shared by fpm trace and request trace.
 //!
 //! Records published on the caller's bus are forwarded into an internal mpsc,
 //! batched into uncompressed bytes, and appended as gzip members. Segments roll
 //! when uncompressed bytes or record-line thresholds are exceeded.
+//!
+//! Where those members land is a [`SegmentSink`]. [`FileSegmentSink`] writes
+//! local `.NNNNNN.jsonl.gz` segments and is what [`JsonlGzipWriter::new`]
+//! installs; [`JsonlGzipWriter::with_segment_sink`] takes any other
+//! destination. Because a segment is a concatenation of self-contained gzip
+//! members, a destination that can only be written once (an S3 object) buffers
+//! the members and commits them in `close_segment`.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow};
+use async_trait::async_trait;
 use flate2::{Compression, write::GzEncoder};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Destination for finished gzip members.
+///
+/// `seq` identifies the segment a member belongs to. It is dense and starts at
+/// zero for each writer; implementations map it onto their own naming.
+#[async_trait]
+pub trait SegmentSink: Send + Sync + 'static {
+    /// Append one self-contained gzip member to the segment identified by `seq`.
+    async fn append_to_segment(&self, seq: u64, gz_bytes: Vec<u8>) -> anyhow::Result<()>;
+
+    /// Finalize `seq`. Nothing further is appended to it. Destinations that
+    /// cannot be modified after creation commit the whole object here.
+    ///
+    /// Called on every roll and once for the active segment at shutdown, so it
+    /// may fire for a segment that never received a member.
+    async fn close_segment(&self, seq: u64) -> anyhow::Result<()>;
+}
 
 #[derive(Debug, Clone)]
 pub struct JsonlGzipSinkOptions {
@@ -46,9 +72,12 @@ impl Default for JsonlGzipSinkOptions {
 /// Drop requests writer shutdown, but cannot wait for its final flush. Call
 /// [`Self::shutdown`] or [`Self::close`] when completion must be awaited.
 pub struct JsonlGzipWriter<T> {
-    tx: Option<mpsc::Sender<T>>,
+    /// `Mutex` rather than `&mut self` so that `shutdown` takes `&self` and
+    /// sinks stored behind a trait object can flush. Guards are never held
+    /// across an await.
+    tx: Mutex<Option<mpsc::Sender<T>>>,
     shutdown: CancellationToken,
-    worker: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    worker: Mutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>,
 }
 
 #[derive(Serialize)]
@@ -61,50 +90,80 @@ impl<T> JsonlGzipWriter<T>
 where
     T: Serialize + Send + Sync + 'static,
 {
+    /// Open a writer that lands segments as local `.NNNNNN.jsonl.gz` files.
     pub async fn new(path: String, options: JsonlGzipSinkOptions) -> anyhow::Result<Self> {
-        let shutdown = CancellationToken::new();
-        let (tx, rx) = mpsc::channel::<T>(2048);
         let display_path = path.clone();
-        let mut writer =
-            tokio::task::spawn_blocking(move || GzipBatchWriter::<T>::new(path, options))
+        let max_segments = options.max_segments;
+        let segment_sink =
+            tokio::task::spawn_blocking(move || FileSegmentSink::new(path, max_segments))
                 .await
                 .context("gzip jsonl sink initializer panicked")?
                 .with_context(|| format!("opening gzip jsonl sink at {display_path}"))?;
+        Self::with_segment_sink(Arc::new(segment_sink), options)
+    }
+
+    /// Open a writer that lands segments in an arbitrary destination.
+    pub fn with_segment_sink(
+        segment_sink: Arc<dyn SegmentSink>,
+        options: JsonlGzipSinkOptions,
+    ) -> anyhow::Result<Self> {
+        if options.max_segments == Some(0) {
+            return Err(anyhow!("gzip jsonl max_segments must be positive"));
+        }
+
+        let shutdown = CancellationToken::new();
+        let (tx, rx) = mpsc::channel::<T>(2048);
+        let mut writer = GzipBatchWriter::<T>::new(segment_sink, options);
         let worker_shutdown = shutdown.clone();
 
         let worker =
             tokio::spawn(async move { run_gzip_writer(rx, &mut writer, worker_shutdown).await });
 
         Ok(Self {
-            tx: Some(tx),
+            tx: Mutex::new(Some(tx)),
             shutdown,
-            worker: Some(worker),
+            worker: Mutex::new(Some(worker)),
         })
     }
 
     /// Forward a record to the writer task. Returns `Err` if the worker has
     /// shut down.
     pub async fn send(&self, rec: T) -> Result<(), mpsc::error::SendError<T>> {
-        match &self.tx {
+        // Clone the sender out of the guard: a send may block on a full
+        // channel, and the guard must not be held across that await.
+        let tx = match self.tx.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        match tx {
             Some(tx) => tx.send(rec).await,
             None => Err(mpsc::error::SendError(rec)),
         }
     }
 
-    /// Drain all accepted records, flush the active segment, and wait for the
-    /// writer task to exit.
-    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
-        self.tx.take();
+    /// Drain all accepted records, flush and close the active segment, and wait
+    /// for the writer task to exit. Idempotent.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        // Closing the sender lets an idle worker finish; cancelling wakes a
+        // worker parked on the flush tick.
+        Self::take(&self.tx);
         self.shutdown.cancel();
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = Self::take(&self.worker) {
             worker.await.context("gzip jsonl writer task panicked")??;
         }
         Ok(())
     }
 
     /// Consuming convenience wrapper around [`Self::shutdown`].
-    pub async fn close(mut self) -> anyhow::Result<()> {
+    pub async fn close(self) -> anyhow::Result<()> {
         self.shutdown().await
+    }
+
+    fn take<U>(slot: &Mutex<Option<U>>) -> Option<U> {
+        match slot.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
     }
 }
 
@@ -115,12 +174,10 @@ impl<T> Drop for JsonlGzipWriter<T> {
 }
 
 struct GzipBatchWriter<T: Serialize> {
-    base_path: PathBuf,
-    current_index: u64,
+    segment_sink: Arc<dyn SegmentSink>,
+    current_seq: u64,
     start_time: Instant,
     batch: Vec<u8>,
-    active_file: Option<File>,
-    prune_pending: bool,
     segment_uncompressed_bytes: u64,
     segment_lines: u64,
     options: JsonlGzipSinkOptions,
@@ -128,32 +185,17 @@ struct GzipBatchWriter<T: Serialize> {
 }
 
 impl<T: Serialize> GzipBatchWriter<T> {
-    fn new(path: String, options: JsonlGzipSinkOptions) -> anyhow::Result<Self> {
-        if options.max_segments == Some(0) {
-            return Err(anyhow!("gzip jsonl max_segments must be positive"));
-        }
-
-        let base_path = PathBuf::from(path);
-        if let Some(parent) = base_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating gzip jsonl directory {}", parent.display()))?;
-        }
-
-        let current_index = next_segment_index(&base_path)?;
-        Ok(Self {
-            base_path,
-            current_index,
+    fn new(segment_sink: Arc<dyn SegmentSink>, options: JsonlGzipSinkOptions) -> Self {
+        Self {
+            segment_sink,
+            current_seq: 0,
             start_time: Instant::now(),
             batch: Vec::with_capacity(options.buffer_bytes.max(1)),
-            active_file: None,
-            prune_pending: true,
             segment_uncompressed_bytes: 0,
             segment_lines: 0,
             options,
             _marker: std::marker::PhantomData,
-        })
+        }
     }
 
     async fn push(&mut self, rec: &T) -> anyhow::Result<()> {
@@ -167,7 +209,7 @@ impl<T: Serialize> GzipBatchWriter<T> {
         let line_len = line.len() as u64;
         if self.should_roll_before(line_len) {
             self.flush_batch().await?;
-            self.roll_segment();
+            self.roll_segment().await?;
         }
 
         self.batch.extend_from_slice(&line);
@@ -199,12 +241,19 @@ impl<T: Serialize> GzipBatchWriter<T> {
             .is_some_and(|limit| self.segment_lines >= limit)
     }
 
-    fn roll_segment(&mut self) {
-        self.current_index = self.current_index.saturating_add(1);
-        self.active_file = None;
-        self.prune_pending = true;
+    /// Finalize the outgoing segment and advance. Callers must flush first:
+    /// once `close_segment` returns, nothing more can be added to it.
+    async fn roll_segment(&mut self) -> anyhow::Result<()> {
+        let closing_seq = self.current_seq;
+        self.current_seq = self.current_seq.saturating_add(1);
         self.segment_uncompressed_bytes = 0;
         self.segment_lines = 0;
+        self.segment_sink.close_segment(closing_seq).await
+    }
+
+    /// Close whatever segment is still open. Used on the shutdown paths.
+    async fn close_current_segment(&mut self) -> anyhow::Result<()> {
+        self.segment_sink.close_segment(self.current_seq).await
     }
 
     async fn flush_batch(&mut self) -> anyhow::Result<()> {
@@ -213,22 +262,102 @@ impl<T: Serialize> GzipBatchWriter<T> {
         }
 
         let batch = std::mem::take(&mut self.batch);
-        let base_path = self.base_path.clone();
-        let current_index = self.current_index;
-        let max_segments = self.options.max_segments;
-        let active_file = self.active_file.take();
-        let prune_pending = self.prune_pending;
+        // Compression is CPU-bound: keep it off the async worker thread.
+        let gz_bytes = tokio::task::spawn_blocking(move || compress_member(batch))
+            .await
+            .context("gzip jsonl compressor panicked")??;
 
-        let (active_file, current_index, result) = tokio::task::spawn_blocking(move || {
-            let (mut active_file, current_index, path) = match active_file {
-                Some(file) => (file, current_index, segment_path(&base_path, current_index)),
-                None => match create_available_segment(&base_path, current_index) {
-                    Ok(segment) => segment,
-                    Err(err) => return (None, current_index, Err(err)),
+        self.segment_sink
+            .append_to_segment(self.current_seq, gz_bytes)
+            .await
+    }
+}
+
+/// Local `.NNNNNN.jsonl.gz` segments. Sequence numbers are mapped onto the
+/// first free on-disk index so a restart never overwrites existing segments.
+pub struct FileSegmentSink {
+    base_path: PathBuf,
+    max_segments: Option<usize>,
+    state: Mutex<FileSegmentState>,
+}
+
+struct FileSegmentState {
+    /// Index the next new segment starts probing from.
+    next_index: u64,
+    active: Option<ActiveSegment>,
+    prune_pending: bool,
+}
+
+struct ActiveSegment {
+    seq: u64,
+    index: u64,
+    path: PathBuf,
+    file: File,
+}
+
+impl FileSegmentSink {
+    pub fn new(path: String, max_segments: Option<usize>) -> anyhow::Result<Self> {
+        let base_path = PathBuf::from(path);
+        if let Some(parent) = base_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating gzip jsonl directory {}", parent.display()))?;
+        }
+
+        let next_index = next_segment_index(&base_path)?;
+        Ok(Self {
+            base_path,
+            max_segments,
+            state: Mutex::new(FileSegmentState {
+                next_index,
+                active: None,
+                prune_pending: true,
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FileSegmentState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[async_trait]
+impl SegmentSink for FileSegmentSink {
+    async fn append_to_segment(&self, seq: u64, gz_bytes: Vec<u8>) -> anyhow::Result<()> {
+        let (active, next_index, prune_pending) = {
+            let mut state = self.lock();
+            // A member for a new seq retires whatever is still open.
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.seq != seq)
+            {
+                let previous = state.active.take().expect("checked above");
+                state.next_index = previous.index.saturating_add(1);
+                state.prune_pending = true;
+            }
+            (state.active.take(), state.next_index, state.prune_pending)
+        };
+
+        let base_path = self.base_path.clone();
+        let max_segments = self.max_segments;
+
+        let (active, result) = tokio::task::spawn_blocking(move || {
+            let mut active = match active {
+                Some(active) => active,
+                None => match create_available_segment(&base_path, next_index) {
+                    Ok((file, index, path)) => ActiveSegment {
+                        seq,
+                        index,
+                        path,
+                        file,
+                    },
+                    Err(err) => return (None, Err(err)),
                 },
             };
 
-            let result = write_gzip_member(&mut active_file, &path, batch).map(|()| {
+            let result = write_gzip_member(&mut active.file, &active.path, gz_bytes).map(|()| {
                 if prune_pending
                     && let Some(max_segments) = max_segments
                     && let Err(err) = prune_segments(&base_path, max_segments)
@@ -236,18 +365,34 @@ impl<T: Serialize> GzipBatchWriter<T> {
                     tracing::warn!("gzip jsonl sink failed to prune old segments: {err}");
                 }
             });
-            (Some(active_file), current_index, result)
+            (Some(active), result)
         })
         .await
         .context("gzip jsonl writer task panicked")?;
 
-        self.active_file = active_file;
-        self.current_index = current_index;
-        if result.is_ok() {
-            self.prune_pending = false;
+        let mut state = self.lock();
+        if let Some(active) = &active {
+            state.next_index = active.index;
         }
-        result?;
+        state.active = active;
+        if result.is_ok() {
+            state.prune_pending = false;
+        }
+        result
+    }
 
+    async fn close_segment(&self, seq: u64) -> anyhow::Result<()> {
+        let mut state = self.lock();
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.seq == seq)
+        {
+            let closed = state.active.take().expect("checked above");
+            // Dropping the handle closes the file; the next segment starts after it.
+            state.next_index = closed.index.saturating_add(1);
+            state.prune_pending = true;
+        }
         Ok(())
     }
 }
@@ -276,6 +421,10 @@ async fn run_gzip_writer<T: Serialize>(
                     tracing::warn!("gzip jsonl sink failed final flush: {err}");
                     first_error.get_or_insert(err);
                 }
+                if let Err(err) = writer.close_current_segment().await {
+                    tracing::warn!("gzip jsonl sink failed to close final segment: {err}");
+                    first_error.get_or_insert(err);
+                }
                 return first_error.map_or(Ok(()), Err);
             }
             _ = flush_tick.tick() => {
@@ -295,6 +444,10 @@ async fn run_gzip_writer<T: Serialize>(
                     None => {
                         if let Err(err) = writer.flush_batch().await {
                             tracing::warn!("gzip jsonl sink failed final flush: {err}");
+                            first_error.get_or_insert(err);
+                        }
+                        if let Err(err) = writer.close_current_segment().await {
+                            tracing::warn!("gzip jsonl sink failed to close final segment: {err}");
                             first_error.get_or_insert(err);
                         }
                         return first_error.map_or(Ok(()), Err);
@@ -353,15 +506,22 @@ fn create_available_segment(
     }
 }
 
-fn write_gzip_member(file: &mut File, path: &Path, batch: Vec<u8>) -> anyhow::Result<()> {
-    let writer = BufWriter::new(file);
-    let mut encoder = GzEncoder::new(writer, Compression::default());
+/// Compress one batch into a self-contained gzip member. Concatenating members
+/// yields a valid gzip stream, which is what lets a segment be built up from
+/// several flushes. Blocking and CPU-bound: call from `spawn_blocking`.
+fn compress_member(batch: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(&batch)
-        .with_context(|| format!("compressing gzip jsonl segment {}", path.display()))?;
-    let mut writer = encoder
-        .finish()
-        .with_context(|| format!("finishing gzip jsonl segment {}", path.display()))?;
+        .context("compressing gzip jsonl member")?;
+    encoder.finish().context("finishing gzip jsonl member")
+}
+
+fn write_gzip_member(file: &mut File, path: &Path, gz_bytes: Vec<u8>) -> anyhow::Result<()> {
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(&gz_bytes)
+        .with_context(|| format!("writing gzip jsonl segment {}", path.display()))?;
     writer
         .flush()
         .with_context(|| format!("flushing gzip jsonl segment {}", path.display()))?;
@@ -477,6 +637,18 @@ mod tests {
     struct TestRecord {
         id: u64,
         name: String,
+    }
+
+    /// A batch writer over local file segments, as `JsonlGzipWriter::new` builds.
+    fn file_batch_writer(
+        path: &Path,
+        options: JsonlGzipSinkOptions,
+    ) -> anyhow::Result<GzipBatchWriter<TestRecord>> {
+        let segment_sink = FileSegmentSink::new(path.display().to_string(), options.max_segments)?;
+        Ok(GzipBatchWriter::<TestRecord>::new(
+            Arc::new(segment_sink),
+            options,
+        ))
     }
 
     fn read_gzip_jsonl(path: &Path) -> String {
@@ -691,8 +863,8 @@ mod tests {
         std::fs::write(&oldest, b"old zero").unwrap();
         std::fs::write(segment_path(&path, 1), b"old one").unwrap();
 
-        let mut writer = GzipBatchWriter::<TestRecord>::new(
-            path.display().to_string(),
+        let mut writer = file_batch_writer(
+            &path,
             JsonlGzipSinkOptions {
                 buffer_bytes: 1024,
                 flush_interval: Duration::from_secs(60),
@@ -884,8 +1056,8 @@ mod tests {
         let original = b"must remain unchanged";
         std::fs::write(&target, original).unwrap();
 
-        let mut writer = GzipBatchWriter::<TestRecord>::new(
-            path.display().to_string(),
+        let mut writer = file_batch_writer(
+            &path,
             JsonlGzipSinkOptions {
                 buffer_bytes: 1024,
                 flush_interval: Duration::from_secs(60),
@@ -920,8 +1092,8 @@ mod tests {
     fn rolls_only_after_uncompressed_limit_would_be_exceeded() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_trace");
-        let mut writer = GzipBatchWriter::<TestRecord>::new(
-            path.display().to_string(),
+        let mut writer = file_batch_writer(
+            &path,
             JsonlGzipSinkOptions {
                 roll_uncompressed_bytes: 100,
                 ..Default::default()
