@@ -429,6 +429,11 @@ mod tests {
         env_request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT,
         env_request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_TOPIC,
         env_request_trace::DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST,
+        env_request_trace::DYN_REQUEST_TRACE_S3_BUCKET,
+        env_request_trace::DYN_REQUEST_TRACE_S3_REGION,
+        env_request_trace::DYN_REQUEST_TRACE_S3_PREFIX,
+        env_request_trace::DYN_REQUEST_TRACE_S3_ROLL_BYTES,
+        env_request_trace::DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS,
         env_audit::DYN_AUDIT_SINKS,
         env_audit::DYN_AUDIT_FORCE_LOGGING,
         env_audit::DYN_AUDIT_CAPACITY,
@@ -875,5 +880,84 @@ mod tests {
             assert!(policy.tool_events_zmq_endpoint.is_none());
             assert!(policy.tool_events_zmq_topic.is_none());
         });
+    }
+
+    #[test]
+    fn parses_s3_sink_name() {
+        use RequestTraceSinkKind::{File, Nats, S3};
+
+        // (DYN_REQUEST_TRACE_SINKS value, expected sinks in order)
+        let cases: &[(&str, Vec<RequestTraceSinkKind>)] = &[
+            ("s3", vec![S3]),
+            ("S3", vec![S3]),
+            ("  s3  ", vec![S3]),
+            ("file,s3", vec![File, S3]),
+            ("s3,nats", vec![S3, Nats]),
+            ("s3,s3", vec![S3]),
+            ("s3,,", vec![S3]),
+            ("s3x", vec![]),
+        ];
+
+        for (value, expected) in cases {
+            let (sinks, _) = parse_sink_kind_names(value);
+            assert_eq!(&sinks, expected, "DYN_REQUEST_TRACE_SINKS={value:?}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn s3_policy_defaults_load_from_env() {
+        with_request_trace_env(
+            &[
+                (env_request_trace::DYN_REQUEST_TRACE, "1"),
+                (env_request_trace::DYN_REQUEST_TRACE_SINKS, "s3"),
+                (env_request_trace::DYN_REQUEST_TRACE_S3_BUCKET, "my-bucket"),
+            ],
+            || {
+                let policy = load_from_env();
+                assert!(policy.enabled);
+                assert_eq!(policy.sinks, vec![RequestTraceSinkKind::S3]);
+                assert_eq!(policy.s3_bucket.as_deref(), Some("my-bucket"));
+                assert_eq!(policy.s3_prefix, DEFAULT_S3_PREFIX);
+                assert_eq!(policy.s3_roll_bytes, DEFAULT_FILE_ROLL_BYTES);
+                assert_eq!(policy.s3_flush_interval_ms, DEFAULT_FILE_FLUSH_INTERVAL_MS);
+                assert!(policy.s3_region.is_none());
+                // An s3-only config must not default a local file path.
+                assert!(policy.file_path.is_none());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn s3_policy_reads_overrides_from_env() {
+        with_request_trace_env(
+            &[
+                (env_request_trace::DYN_REQUEST_TRACE, "1"),
+                (env_request_trace::DYN_REQUEST_TRACE_SINKS, "file,s3"),
+                (env_request_trace::DYN_REQUEST_TRACE_S3_BUCKET, "my-bucket"),
+                (env_request_trace::DYN_REQUEST_TRACE_S3_REGION, "us-west-2"),
+                (env_request_trace::DYN_REQUEST_TRACE_S3_PREFIX, "traces/dev"),
+                (env_request_trace::DYN_REQUEST_TRACE_S3_ROLL_BYTES, "4096"),
+                (
+                    env_request_trace::DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS,
+                    "250",
+                ),
+            ],
+            || {
+                let policy = load_from_env();
+                assert_eq!(
+                    policy.sinks,
+                    vec![RequestTraceSinkKind::File, RequestTraceSinkKind::S3]
+                );
+                assert_eq!(policy.s3_bucket.as_deref(), Some("my-bucket"));
+                assert_eq!(policy.s3_region.as_deref(), Some("us-west-2"));
+                assert_eq!(policy.s3_prefix, "traces/dev");
+                assert_eq!(policy.s3_roll_bytes, 4096);
+                assert_eq!(policy.s3_flush_interval_ms, 250);
+                // The file sink still defaults its own path independently.
+                assert_eq!(policy.file_path.as_deref(), Some(DEFAULT_FILE_PATH));
+            },
+        );
     }
 }

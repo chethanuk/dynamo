@@ -394,4 +394,172 @@ mod tests {
             assert!(content.contains("\"request_id\":\"req-123\""));
         }
     }
+
+    #[cfg(feature = "request-trace-s3")]
+    mod s3 {
+        use aws_sdk_s3::config::http::{HttpRequest, HttpResponse};
+        use aws_sdk_s3::primitives::SdkBody;
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+
+        use crate::telemetry::s3_segment_sink::{S3SegmentIdentity, S3SegmentSinkConfig};
+
+        use super::*;
+        use crate::request_trace::sink::S3RequestTraceSink;
+
+        const BUCKET: &str = "test-bucket";
+        const PREFIX: &str = "test-prefix";
+
+        /// One canned `200 OK` for each PUT the sink is expected to make.
+        fn replay_client(puts: usize) -> StaticReplayClient {
+            StaticReplayClient::new(
+                (0..puts)
+                    .map(|_| {
+                        ReplayEvent::new(
+                            HttpRequest::new(SdkBody::empty()),
+                            HttpResponse::new(200_u16.try_into().unwrap(), SdkBody::empty()),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+
+        fn s3_client(replay: &StaticReplayClient) -> aws_sdk_s3::Client {
+            let config = aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "test",
+                ))
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .http_client(replay.clone())
+                .build();
+            aws_sdk_s3::Client::from_conf(config)
+        }
+
+        fn test_config() -> S3SegmentSinkConfig {
+            S3SegmentSinkConfig {
+                bucket: BUCKET.to_string(),
+                prefix: PREFIX.to_string(),
+                identity: S3SegmentIdentity {
+                    instance: "pod-a".to_string(),
+                    startup: "deadbeef".to_string(),
+                },
+            }
+        }
+
+        /// Thresholds high enough that nothing but an explicit shutdown can
+        /// trigger an upload.
+        fn no_roll_options() -> JsonlGzipSinkOptions {
+            JsonlGzipSinkOptions {
+                buffer_bytes: 1,
+                flush_interval: Duration::from_secs(60),
+                roll_uncompressed_bytes: 1024 * 1024 * 1024,
+                roll_lines: None,
+                max_segments: None,
+            }
+        }
+
+        fn gunzip(bytes: &[u8]) -> String {
+            let mut out = String::new();
+            MultiGzDecoder::new(bytes).read_to_string(&mut out).unwrap();
+            out
+        }
+
+        fn assert_key_matches(uri: &str, seq: u64) {
+            // {prefix}/YYYY/MM/DD/HH/{instance}-{startup}-{seq:06}.jsonl.gz
+            let expected_suffix = format!("/pod-a-deadbeef-{seq:06}.jsonl.gz");
+            assert!(
+                uri.ends_with(&expected_suffix),
+                "uri {uri:?} should end with {expected_suffix:?}"
+            );
+            let path = uri.split('?').next().unwrap();
+            let rest = path
+                .strip_prefix(&format!("/{BUCKET}/{PREFIX}/"))
+                .unwrap_or_else(|| panic!("uri {uri:?} missing /{BUCKET}/{PREFIX}/ prefix"));
+            let parts: Vec<&str> = rest.split('/').collect();
+            assert_eq!(parts.len(), 5, "expected YYYY/MM/DD/HH/object in {rest:?}");
+            assert!(
+                parts[0].len() == 4 && parts[0].chars().all(|c| c.is_ascii_digit()),
+                "year {:?} in {rest:?}",
+                parts[0]
+            );
+            for part in &parts[1..4] {
+                assert!(
+                    part.len() == 2 && part.chars().all(|c| c.is_ascii_digit()),
+                    "date part {part:?} in {rest:?}"
+                );
+            }
+        }
+
+        /// The bug: records buffered below the roll threshold are only uploaded
+        /// if `shutdown()` flushes and closes the segment. Without that, the
+        /// final object never lands.
+        #[tokio::test]
+        async fn s3_sink_uploads_pending_records_on_shutdown() {
+            let replay = replay_client(1);
+            let sink = S3RequestTraceSink::new(s3_client(&replay), test_config(), no_roll_options())
+                .await
+                .unwrap();
+
+            sink.emit(&sample_record()).await;
+            sink.shutdown().await;
+
+            let requests: Vec<_> = replay.actual_requests().collect();
+            assert_eq!(
+                requests.len(),
+                1,
+                "expected exactly one PUT for the pending segment"
+            );
+            assert_eq!(requests[0].method(), "PUT");
+            assert_key_matches(requests[0].uri(), 0);
+
+            let body = gunzip(requests[0].body().bytes().expect("in-memory body"));
+            assert!(body.contains("\"schema\":\"dynamo.request.trace.v1\""), "{body}");
+            assert!(body.contains("\"request_id\":\"req-123\""), "{body}");
+        }
+
+        /// S3 objects cannot be appended to after the fact, so every roll must
+        /// finalize the segment it leaves behind, not just the last one.
+        #[tokio::test]
+        async fn s3_sink_uploads_each_segment_on_roll() {
+            let replay = replay_client(2);
+            let options = JsonlGzipSinkOptions {
+                roll_lines: Some(1),
+                ..no_roll_options()
+            };
+            let sink = S3RequestTraceSink::new(s3_client(&replay), test_config(), options)
+                .await
+                .unwrap();
+
+            sink.emit(&sample_record()).await;
+            sink.emit(&sample_record()).await;
+            sink.shutdown().await;
+
+            let requests: Vec<_> = replay.actual_requests().collect();
+            assert_eq!(requests.len(), 2, "expected one PUT per rolled segment");
+            for (seq, request) in requests.iter().enumerate() {
+                assert_eq!(request.method(), "PUT");
+                assert_key_matches(request.uri(), seq as u64);
+                let body = gunzip(request.body().bytes().expect("in-memory body"));
+                assert!(body.contains("\"request_id\":\"req-123\""), "{body}");
+            }
+        }
+
+        /// Selecting the s3 sink without a bucket must fail loudly, naming the
+        /// variable the operator forgot.
+        #[tokio::test]
+        async fn s3_sink_without_bucket_fails() {
+            let mut policy = config::policy().clone();
+            policy.s3_bucket = None;
+
+            let error = S3RequestTraceSink::from_policy(&policy)
+                .await
+                .expect_err("s3 sink must not build without a bucket");
+            assert!(
+                error
+                    .to_string()
+                    .contains(env_request_trace::DYN_REQUEST_TRACE_S3_BUCKET),
+                "error should name the missing variable, got: {error}"
+            );
+        }
+    }
 }
