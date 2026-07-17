@@ -18,6 +18,7 @@ const DEFAULT_FILE_BUFFER_BYTES: usize = 1024 * 1024;
 const DEFAULT_FILE_FLUSH_INTERVAL_MS: u64 = 1000;
 const DEFAULT_FILE_ROLL_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_FILE_PATH: &str = "/tmp/dynamo-request-trace";
+const DEFAULT_S3_PREFIX: &str = "dynamo-request-trace";
 const DEFAULT_NATS_SUBJECT: &str = "dynamo.request_trace.v1";
 const DEFAULT_LEGACY_AUDIT_NATS_SUBJECT: &str = "dynamo.audit.v1";
 const DEFAULT_OTEL_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
@@ -32,6 +33,7 @@ pub enum RequestTraceSinkKind {
     Stderr,
     Nats,
     Otel,
+    S3,
 }
 
 impl RequestTraceSinkKind {
@@ -41,6 +43,7 @@ impl RequestTraceSinkKind {
             Self::Stderr => "stderr",
             Self::Nats => "nats",
             Self::Otel => "otel",
+            Self::S3 => "s3",
         }
     }
 }
@@ -94,6 +97,11 @@ pub struct RequestTracePolicy {
     pub http_header_capture_list: Vec<String>,
     pub tool_events_zmq_endpoint: Option<String>,
     pub tool_events_zmq_topic: Option<String>,
+    pub s3_bucket: Option<String>,
+    pub s3_region: Option<String>,
+    pub s3_prefix: String,
+    pub s3_roll_bytes: u64,
+    pub s3_flush_interval_ms: u64,
 }
 
 impl RequestTracePolicy {
@@ -215,6 +223,18 @@ fn load_from_env() -> RequestTracePolicy {
             .unwrap_or_else(|| DEFAULT_TOOL_EVENTS_TOPIC.to_string())
     });
 
+    let s3_bucket = env_trimmed(env_request_trace::DYN_REQUEST_TRACE_S3_BUCKET);
+    let s3_region = env_trimmed(env_request_trace::DYN_REQUEST_TRACE_S3_REGION);
+    let s3_prefix = env_trimmed(env_request_trace::DYN_REQUEST_TRACE_S3_PREFIX)
+        .unwrap_or_else(|| DEFAULT_S3_PREFIX.to_string());
+    let s3_roll_bytes = env_u64(&[env_request_trace::DYN_REQUEST_TRACE_S3_ROLL_BYTES])
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FILE_ROLL_BYTES);
+    let s3_flush_interval_ms =
+        env_u64(&[env_request_trace::DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS])
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_FILE_FLUSH_INTERVAL_MS);
+
     RequestTracePolicy {
         enabled,
         records,
@@ -231,6 +251,11 @@ fn load_from_env() -> RequestTracePolicy {
         http_header_capture_list,
         tool_events_zmq_endpoint,
         tool_events_zmq_topic,
+        s3_bucket,
+        s3_region,
+        s3_prefix,
+        s3_roll_bytes,
+        s3_flush_interval_ms,
     }
 }
 
@@ -314,6 +339,7 @@ fn parse_sink_kind_names(
             "stderr" => push_sink(&mut sinks, RequestTraceSinkKind::Stderr),
             "nats" => push_sink(&mut sinks, RequestTraceSinkKind::Nats),
             "otel" => push_sink(&mut sinks, RequestTraceSinkKind::Otel),
+            "s3" => push_sink(&mut sinks, RequestTraceSinkKind::S3),
             "jsonl" => {
                 legacy_jsonl = true;
                 push_sink(&mut sinks, RequestTraceSinkKind::File);

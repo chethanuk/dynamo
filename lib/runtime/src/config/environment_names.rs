@@ -468,7 +468,8 @@ pub mod llm {
         /// Master switch. Truthy enables request trace emission.
         pub const DYN_REQUEST_TRACE: &str = "DYN_REQUEST_TRACE";
 
-        /// Request trace sink selection. Comma-separated values: `file`, `stderr`, `nats`, `otel`.
+        /// Request trace sink selection. Comma-separated values: `file`, `stderr`,
+        /// `nats`, `otel`, `s3`.
         ///
         /// Legacy values map as follows: `jsonl` => `file` with `jsonl` format,
         /// `jsonl_gz` => `file` with `jsonl_gz` format, `stderr` => `stderr`,
@@ -531,6 +532,26 @@ pub mod llm {
         /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_ROLL_LINES`.
         pub const DYN_REQUEST_TRACE_JSONL_GZ_ROLL_LINES: &str =
             "DYN_REQUEST_TRACE_JSONL_GZ_ROLL_LINES";
+
+        /// Destination bucket for the `s3` sink. Required when
+        /// `DYN_REQUEST_TRACE_SINKS` includes `s3`.
+        pub const DYN_REQUEST_TRACE_S3_BUCKET: &str = "DYN_REQUEST_TRACE_S3_BUCKET";
+
+        /// Region override for the `s3` sink. Unset falls back to the standard
+        /// AWS chain (`AWS_REGION`, profile, instance metadata).
+        pub const DYN_REQUEST_TRACE_S3_REGION: &str = "DYN_REQUEST_TRACE_S3_REGION";
+
+        /// Object key prefix for the `s3` sink. Keys are
+        /// `{prefix}/YYYY/MM/DD/HH/{instance}-{startup}-{seq}.jsonl.gz`.
+        pub const DYN_REQUEST_TRACE_S3_PREFIX: &str = "DYN_REQUEST_TRACE_S3_PREFIX";
+
+        /// S3 sink roll threshold in uncompressed bytes. Each rolled segment is
+        /// uploaded as one object.
+        pub const DYN_REQUEST_TRACE_S3_ROLL_BYTES: &str = "DYN_REQUEST_TRACE_S3_ROLL_BYTES";
+
+        /// S3 sink batch flush interval in milliseconds.
+        pub const DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS: &str =
+            "DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS";
 
         /// Local ZMQ PULL endpoint Dynamo binds for harness tool events.
         pub const DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT: &str =
@@ -838,6 +859,11 @@ mod tests {
             llm::request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT,
             llm::request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_TOPIC,
             llm::request_trace::DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST,
+            llm::request_trace::DYN_REQUEST_TRACE_S3_BUCKET,
+            llm::request_trace::DYN_REQUEST_TRACE_S3_REGION,
+            llm::request_trace::DYN_REQUEST_TRACE_S3_PREFIX,
+            llm::request_trace::DYN_REQUEST_TRACE_S3_ROLL_BYTES,
+            llm::request_trace::DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS,
             llm::audit::DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES,
             // Model
             model::model_express::MODEL_EXPRESS_URL,

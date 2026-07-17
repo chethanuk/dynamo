@@ -40,7 +40,7 @@ export DYN_REQUEST_TRACE_FILE_PATH=/mnt/captures/run-42/request-trace
 | --- | --- | --- | --- |
 | `DYN_REQUEST_TRACE` | unset | Truthy value | Master switch. When enabled and `DYN_REQUEST_TRACE_RECORDS` is unset, emits `request_end,tool`. |
 | `DYN_REQUEST_TRACE_RECORDS` | `request_end,tool` when `DYN_REQUEST_TRACE=1`; unset otherwise | `request_end`, `request_payload`, `tool` | Comma-separated record types to emit. Setting this variable enables only the listed records. |
-| `DYN_REQUEST_TRACE_SINKS` | `file` | `file`, `stderr`, `nats`, `otel` | Comma-separated record sinks. |
+| `DYN_REQUEST_TRACE_SINKS` | `file` | `file`, `stderr`, `nats`, `otel`, `s3` | Comma-separated record sinks. |
 | `DYN_REQUEST_TRACE_FILE_PATH` | `/tmp/dynamo-request-trace` | File path or segment prefix | Literal path when `DYN_REQUEST_TRACE_FILE_FORMAT=jsonl`; gzip segment prefix when `DYN_REQUEST_TRACE_FILE_FORMAT=jsonl_gz`. |
 | `DYN_REQUEST_TRACE_FILE_FORMAT` | `jsonl_gz` | `jsonl`, `jsonl_gz` | File record format. `jsonl_gz` writes `<prefix>.<index>.jsonl.gz`; `jsonl` writes a literal JSONL path. |
 | `DYN_REQUEST_TRACE_CAPACITY` | `1024` | Positive integer | Best-effort in-process broadcast capacity. |
@@ -50,6 +50,11 @@ export DYN_REQUEST_TRACE_FILE_PATH=/mnt/captures/run-42/request-trace
 | `DYN_REQUEST_TRACE_FILE_FLUSH_INTERVAL_MS` | `1000` | Integer milliseconds | Periodic flush interval. |
 | `DYN_REQUEST_TRACE_FILE_ROLL_BYTES` | `268435456` | Positive integer bytes | Gzip roll threshold in uncompressed bytes. |
 | `DYN_REQUEST_TRACE_FILE_ROLL_LINES` | unset | Positive integer records | Optional gzip roll threshold in records. |
+| `DYN_REQUEST_TRACE_S3_BUCKET` | unset (required for `s3`) | S3 bucket name | Destination bucket when `DYN_REQUEST_TRACE_SINKS` includes `s3`. |
+| `DYN_REQUEST_TRACE_S3_REGION` | unset | AWS region | Optional region override for the `s3` sink. Unset falls back to the standard AWS chain (`AWS_REGION`, profile, instance metadata). |
+| `DYN_REQUEST_TRACE_S3_PREFIX` | `dynamo-request-trace` | Object key prefix | Object key prefix for the `s3` sink. Keys are `{prefix}/YYYY/MM/DD/HH/{instance}-{startup}-{seq}.jsonl.gz`. |
+| `DYN_REQUEST_TRACE_S3_ROLL_BYTES` | `268435456` | Positive integer bytes | Uncompressed-byte roll threshold for the `s3` sink. Each rolled segment is uploaded as one object. |
+| `DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS` | `1000` | Integer milliseconds | Batch flush interval for the `s3` sink. |
 | `DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT` | unset | ZMQ bind address | Optional ZMQ PULL bind address for harness tool events. |
 | `DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_TOPIC` | `agent-tool-events` | ZMQ topic | First-frame ZMQ topic filter when endpoint is configured. |
 | `DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST` | unset (none) | Comma/whitespace-separated header names | Allowlist of HTTP request header names to record in `request_payload` rows (`payload.http_request_headers`), case-insensitive. Only listed headers are captured; unset/empty captures none. Applies to every sink. Captured values are unredacted, so avoid allowlisting credential-bearing headers. |
@@ -83,6 +88,13 @@ The `otel` sink uses the standard `OTEL_EXPORTER_OTLP_*` variables. Set
 route request trace records through an OpenTelemetry Collector. The `otel`
 sink writes each request trace row as one OTLP log record with the full
 row serialized in the `payload` attribute.
+
+The `s3` sink writes rolled `.jsonl.gz` segments straight to a bucket with the
+standard AWS credential and config chain. Credentials, region, and endpoint
+come from the usual AWS environment (`AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` or the instance/pod identity, plus optional
+`AWS_REGION`, `AWS_ENDPOINT_URL`, and `AWS_MAX_ATTEMPTS`). Set
+`DYN_REQUEST_TRACE_S3_BUCKET` when `DYN_REQUEST_TRACE_SINKS` includes `s3`.
 
 ## Record Shape
 
