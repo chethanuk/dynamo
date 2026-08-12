@@ -4,6 +4,8 @@
 pub mod bus;
 pub mod jsonl;
 pub mod jsonl_gz;
+#[cfg(feature = "request-trace-s3")]
+pub mod s3_segment_sink;
 pub mod stream;
 
 /// Parse a comma-separated list of sink names from an env-var value.

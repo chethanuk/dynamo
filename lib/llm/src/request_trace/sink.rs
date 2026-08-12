@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::telemetry::jsonl::{JsonlSinkOptions, JsonlWriter};
 use crate::telemetry::jsonl_gz::{JsonlGzipSinkOptions, JsonlGzipWriter};
+#[cfg(feature = "request-trace-s3")]
+use crate::telemetry::s3_segment_sink::{S3SegmentIdentity, S3SegmentSink, S3SegmentSinkConfig};
 
 use super::{
     RequestTraceFileFormat, RequestTracePolicy, RequestTraceRecord, RequestTraceSinkKind, config,
@@ -185,6 +187,81 @@ impl RequestTraceSink for JsonlGzipRequestTraceSink {
     }
 }
 
+/// Writes rolled `.jsonl.gz` segments straight to an S3 bucket, so records can
+/// be captured without running an OpenTelemetry collector.
+#[cfg(feature = "request-trace-s3")]
+pub struct S3RequestTraceSink {
+    writer: JsonlGzipWriter<RequestTraceRecord>,
+}
+
+#[cfg(feature = "request-trace-s3")]
+impl S3RequestTraceSink {
+    pub async fn new(
+        client: aws_sdk_s3::Client,
+        config: S3SegmentSinkConfig,
+        options: JsonlGzipSinkOptions,
+    ) -> anyhow::Result<Self> {
+        let bucket = config.bucket.clone();
+        let segment_sink = Arc::new(S3SegmentSink::new(client, config));
+        let writer = JsonlGzipWriter::with_segment_sink(segment_sink, options)
+            .with_context(|| format!("opening s3 request trace sink for bucket {bucket}"))?;
+        Ok(Self { writer })
+    }
+
+    async fn from_policy(policy: &RequestTracePolicy) -> anyhow::Result<Self> {
+        // Check config before building a client so a misconfigured deployment
+        // fails on the variable it is missing, not on credential resolution.
+        let bucket = policy.s3_bucket.clone().ok_or_else(|| {
+            anyhow!(
+                "{} must be set when {} includes s3",
+                env_request_trace::DYN_REQUEST_TRACE_S3_BUCKET,
+                env_request_trace::DYN_REQUEST_TRACE_SINKS
+            )
+        })?;
+
+        let client = S3SegmentSink::build_client(policy.s3_region.clone()).await;
+        Self::new(
+            client,
+            S3SegmentSinkConfig {
+                bucket,
+                prefix: policy.s3_prefix.clone(),
+                identity: S3SegmentIdentity::resolve(),
+            },
+            JsonlGzipSinkOptions {
+                buffer_bytes: policy.file_buffer_bytes,
+                flush_interval: Duration::from_millis(policy.s3_flush_interval_ms.max(1)),
+                roll_uncompressed_bytes: policy.s3_roll_bytes,
+                roll_lines: None,
+                max_segments: None,
+            },
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "request-trace-s3")]
+#[async_trait]
+impl RequestTraceSink for S3RequestTraceSink {
+    fn name(&self) -> &'static str {
+        "s3"
+    }
+
+    async fn emit(&self, record: &RequestTraceRecord) {
+        if self.writer.send(record.clone()).await.is_err() {
+            tracing::warn!("request trace s3 sink closed; dropping record");
+        }
+    }
+
+    /// Without this the pending segment is never uploaded: dropping the writer
+    /// only cancels its task, and an in-flight PUT loses the race with process
+    /// exit.
+    async fn shutdown(&self) {
+        if let Err(error) = self.writer.shutdown().await {
+            tracing::warn!(%error, "request trace s3 sink failed to close cleanly");
+        }
+    }
+}
+
 async fn parse_sinks_from_env() -> anyhow::Result<Vec<Arc<dyn RequestTraceSink>>> {
     let policy = config::policy();
     let mut sinks: Vec<Arc<dyn RequestTraceSink>> = Vec::new();
@@ -205,6 +282,17 @@ async fn parse_sinks_from_env() -> anyhow::Result<Vec<Arc<dyn RequestTraceSink>>
                     JsonlGzipRequestTraceSink::from_policy(policy).await?,
                 )),
             },
+            #[cfg(feature = "request-trace-s3")]
+            RequestTraceSinkKind::S3 => {
+                sinks.push(Arc::new(S3RequestTraceSink::from_policy(policy).await?))
+            }
+            #[cfg(not(feature = "request-trace-s3"))]
+            RequestTraceSinkKind::S3 => {
+                anyhow::bail!(
+                    "{}=s3 requires dynamo-llm to be built with the `request-trace-s3` feature",
+                    env_request_trace::DYN_REQUEST_TRACE_SINKS
+                )
+            }
         }
     }
     Ok(sinks)
@@ -392,6 +480,201 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             assert!(content.contains("\"request_id\":\"req-123\""));
+        }
+    }
+
+    #[cfg(feature = "request-trace-s3")]
+    mod s3 {
+        use aws_sdk_s3::config::http::{HttpRequest, HttpResponse};
+        use aws_sdk_s3::primitives::SdkBody;
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+
+        use crate::telemetry::s3_segment_sink::{S3SegmentIdentity, S3SegmentSinkConfig};
+
+        use super::*;
+        use crate::request_trace::sink::S3RequestTraceSink;
+
+        const BUCKET: &str = "test-bucket";
+        const PREFIX: &str = "test-prefix";
+
+        /// One canned `200 OK` for each PUT the sink is expected to make.
+        fn replay_client(puts: usize) -> StaticReplayClient {
+            StaticReplayClient::new(
+                (0..puts)
+                    .map(|_| {
+                        ReplayEvent::new(
+                            HttpRequest::new(SdkBody::empty()),
+                            HttpResponse::new(200_u16.try_into().unwrap(), SdkBody::empty()),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+
+        fn s3_client(replay: &StaticReplayClient) -> aws_sdk_s3::Client {
+            let config = aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "test",
+                ))
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .http_client(replay.clone())
+                .build();
+            aws_sdk_s3::Client::from_conf(config)
+        }
+
+        fn test_config() -> S3SegmentSinkConfig {
+            S3SegmentSinkConfig {
+                bucket: BUCKET.to_string(),
+                prefix: PREFIX.to_string(),
+                identity: S3SegmentIdentity {
+                    instance: "pod-a".to_string(),
+                    startup: "deadbeef".to_string(),
+                },
+            }
+        }
+
+        /// Thresholds high enough that nothing but an explicit shutdown can
+        /// trigger an upload.
+        fn no_roll_options() -> JsonlGzipSinkOptions {
+            JsonlGzipSinkOptions {
+                buffer_bytes: 1,
+                flush_interval: Duration::from_secs(60),
+                roll_uncompressed_bytes: 1024 * 1024 * 1024,
+                roll_lines: None,
+                max_segments: None,
+            }
+        }
+
+        fn gunzip(bytes: &[u8]) -> String {
+            let mut out = String::new();
+            MultiGzDecoder::new(bytes).read_to_string(&mut out).unwrap();
+            out
+        }
+
+        fn assert_key_matches(uri: &str, seq: u64) {
+            // Virtual-hosted style: https://{bucket}.s3.{region}.amazonaws.com/{key}?x-id=PutObject
+            // Path-style (some configs): https://s3.../{bucket}/{key}?x-id=PutObject
+            // Always strip the query string before matching the key.
+            let path = uri
+                .split('?')
+                .next()
+                .unwrap_or(uri)
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            // Drop the host, keep the object path.
+            let object_path = path.split_once('/').map(|(_, rest)| rest).unwrap_or(path);
+
+            // Concrete check: ends with instance-startup-seq and is under the prefix.
+            let expected_object = format!("pod-a-deadbeef-{seq:06}.jsonl.gz");
+            assert!(
+                object_path.ends_with(&expected_object),
+                "uri {uri:?} object path {object_path:?} should end with {expected_object:?}"
+            );
+            assert!(
+                object_path.contains(&format!("{PREFIX}/")),
+                "uri {uri:?} object path {object_path:?} should contain prefix {PREFIX}/"
+            );
+
+            // {prefix}/YYYY/MM/DD/HH/{instance}-{startup}-{seq:06}.jsonl.gz
+            let rest = object_path
+                .strip_prefix(&format!("{PREFIX}/"))
+                .or_else(|| object_path.strip_prefix(&format!("{BUCKET}/{PREFIX}/")))
+                .unwrap_or_else(|| panic!("uri {uri:?} missing {PREFIX}/ in {object_path:?}"));
+            let parts: Vec<&str> = rest.split('/').collect();
+            assert_eq!(
+                parts.len(),
+                5,
+                "expected YYYY/MM/DD/HH/object in {rest:?} (from {uri:?})"
+            );
+            assert!(
+                parts[0].len() == 4 && parts[0].chars().all(|c| c.is_ascii_digit()),
+                "year {:?} in {rest:?}",
+                parts[0]
+            );
+            for part in &parts[1..4] {
+                assert!(
+                    part.len() == 2 && part.chars().all(|c| c.is_ascii_digit()),
+                    "date part {part:?} in {rest:?}"
+                );
+            }
+        }
+
+        /// The bug: records buffered below the roll threshold are only uploaded
+        /// if `shutdown()` flushes and closes the segment. Without that, the
+        /// final object never lands.
+        #[tokio::test]
+        async fn s3_sink_uploads_pending_records_on_shutdown() {
+            let replay = replay_client(1);
+            let sink =
+                S3RequestTraceSink::new(s3_client(&replay), test_config(), no_roll_options())
+                    .await
+                    .unwrap();
+
+            sink.emit(&sample_record()).await;
+            sink.shutdown().await;
+
+            let requests: Vec<_> = replay.actual_requests().collect();
+            assert_eq!(
+                requests.len(),
+                1,
+                "expected exactly one PUT for the pending segment"
+            );
+            assert_eq!(requests[0].method(), "PUT");
+            assert_key_matches(requests[0].uri(), 0);
+
+            let body = gunzip(requests[0].body().bytes().expect("in-memory body"));
+            assert!(
+                body.contains("\"schema\":\"dynamo.request.trace.v1\""),
+                "{body}"
+            );
+            assert!(body.contains("\"request_id\":\"req-123\""), "{body}");
+        }
+
+        /// S3 objects cannot be appended to after the fact, so every roll must
+        /// finalize the segment it leaves behind, not just the last one.
+        #[tokio::test]
+        async fn s3_sink_uploads_each_segment_on_roll() {
+            let replay = replay_client(2);
+            let options = JsonlGzipSinkOptions {
+                roll_lines: Some(1),
+                ..no_roll_options()
+            };
+            let sink = S3RequestTraceSink::new(s3_client(&replay), test_config(), options)
+                .await
+                .unwrap();
+
+            sink.emit(&sample_record()).await;
+            sink.emit(&sample_record()).await;
+            sink.shutdown().await;
+
+            let requests: Vec<_> = replay.actual_requests().collect();
+            assert_eq!(requests.len(), 2, "expected one PUT per rolled segment");
+            for (seq, request) in requests.iter().enumerate() {
+                assert_eq!(request.method(), "PUT");
+                assert_key_matches(request.uri(), seq as u64);
+                let body = gunzip(request.body().bytes().expect("in-memory body"));
+                assert!(body.contains("\"request_id\":\"req-123\""), "{body}");
+            }
+        }
+
+        /// Selecting the s3 sink without a bucket must fail loudly, naming the
+        /// variable the operator forgot.
+        #[tokio::test]
+        async fn s3_sink_without_bucket_fails() {
+            let mut policy = config::policy().clone();
+            policy.s3_bucket = None;
+
+            let error = match S3RequestTraceSink::from_policy(&policy).await {
+                Ok(_) => panic!("s3 sink must not build without a bucket"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(env_request_trace::DYN_REQUEST_TRACE_S3_BUCKET),
+                "error should name the missing variable, got: {error}"
+            );
         }
     }
 }
