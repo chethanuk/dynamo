@@ -19,7 +19,7 @@ import math
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Literal, Optional, Protocol
+from typing import Literal, Protocol
 from urllib.parse import parse_qsl
 
 import yaml
@@ -45,8 +45,8 @@ class MinimumEndpointConfig(Protocol):
     """Configuration fields used to resolve component endpoint floors."""
 
     min_endpoint: int
-    prefill_min_endpoint: Optional[int]
-    decode_min_endpoint: Optional[int]
+    prefill_min_endpoint: int | None
+    decode_min_endpoint: int | None
 
 
 def resolve_min_endpoint(
@@ -109,16 +109,16 @@ class AICPerfModelSpec(BaseModel):
     hf_id: str = Field(description="HuggingFace model id, e.g. Qwen/Qwen3-32B")
     system: str = Field(description="AIC system identifier, e.g. h200_sxm")
     backend: Literal["trtllm", "vllm", "sglang"]
-    backend_version: Optional[str] = None
+    backend_version: str | None = None
 
-    prefill_pick: Optional[PickedParallelConfig] = None
-    decode_pick: Optional[PickedParallelConfig] = None
+    prefill_pick: PickedParallelConfig | None = None
+    decode_pick: PickedParallelConfig | None = None
 
-    model_arch: Optional[str] = None
-    weight_dtype: Optional[str] = None
-    moe_dtype: Optional[str] = None
-    activation_dtype: Optional[str] = None
-    kv_cache_dtype: Optional[str] = None
+    model_arch: str | None = None
+    weight_dtype: str | None = None
+    moe_dtype: str | None = None
+    activation_dtype: str | None = None
+    kv_cache_dtype: str | None = None
 
 
 class ExternalPluginEntry(BaseModel):
@@ -374,7 +374,7 @@ class PlannerConfig(BaseModel):
     Defaults are sourced from SLAPlannerDefaults.
     """
 
-    pre_deployment_sweeping_mode: Optional[PlannerPreDeploymentSweepMode] = Field(
+    pre_deployment_sweeping_mode: PlannerPreDeploymentSweepMode | None = Field(
         default=PlannerPreDeploymentSweepMode.Rapid,
         description=(
             "Controls optional pre-deployment perf-model bootstrap data. "
@@ -406,7 +406,7 @@ class PlannerConfig(BaseModel):
         ),
     )
 
-    log_dir: Optional[str] = SLAPlannerDefaults.log_dir
+    log_dir: str | None = SLAPlannerDefaults.log_dir
     throughput_adjustment_interval_seconds: int = Field(
         default=SLAPlannerDefaults.throughput_adjustment_interval_seconds,
         validation_alias=AliasChoices(
@@ -441,7 +441,7 @@ class PlannerConfig(BaseModel):
             "Must be nonnegative; 0 permits scale-to-zero."
         ),
     )
-    prefill_min_endpoint: Optional[int] = Field(
+    prefill_min_endpoint: int | None = Field(
         default=SLAPlannerDefaults.prefill_min_endpoint,
         ge=1,
         description=(
@@ -449,7 +449,7 @@ class PlannerConfig(BaseModel):
             "replaces the prefill value supplied by min_endpoint."
         ),
     )
-    decode_min_endpoint: Optional[int] = Field(
+    decode_min_endpoint: int | None = Field(
         default=SLAPlannerDefaults.decode_min_endpoint,
         ge=1,
         description=(
@@ -467,12 +467,12 @@ class PlannerConfig(BaseModel):
         ),
     )
 
-    decode_engine_num_gpu: Optional[int] = None
-    prefill_engine_num_gpu: Optional[int] = None
+    decode_engine_num_gpu: int | None = None
+    prefill_engine_num_gpu: int | None = None
 
     profile_results_dir: str = SLAPlannerDefaults.profile_results_dir
 
-    aic_interpolation: Optional[AICInterpolationSpec] = Field(
+    aic_interpolation: AICInterpolationSpec | None = Field(
         default=None,
         description=(
             "AIConfigurator interpolation spec populated by the profiler in "
@@ -482,7 +482,7 @@ class PlannerConfig(BaseModel):
             "the legacy profile_results_dir file loader)."
         ),
     )
-    aic_perf_model: Optional[AICPerfModelSpec] = Field(
+    aic_perf_model: AICPerfModelSpec | None = Field(
         default=None,
         description=(
             "Native AIC forward-pass perf model identity for the Planner "
@@ -506,7 +506,7 @@ class PlannerConfig(BaseModel):
     load_predictor: str = SLAPlannerDefaults.load_predictor
     load_predictor_log1p: bool = SLAPlannerDefaults.load_predictor_log1p
     prophet_window_size: int = SLAPlannerDefaults.prophet_window_size
-    load_predictor_warmup_trace: Optional[str] = None
+    load_predictor_warmup_trace: str | None = None
 
     # Kalman filter settings
     kalman_q_level: float = SLAPlannerDefaults.kalman_q_level
@@ -522,7 +522,7 @@ class PlannerConfig(BaseModel):
         ),
         exclude=True,
     )
-    metric_pulling_prometheus_token: Optional[str] = Field(
+    metric_pulling_prometheus_token: str | None = Field(
         default_factory=lambda: os.environ.get("PROMETHEUS_TOKEN"),
         exclude=True,
         description=(
@@ -532,7 +532,7 @@ class PlannerConfig(BaseModel):
             "read once at startup."
         ),
     )
-    metric_pulling_prometheus_token_file: Optional[str] = Field(
+    metric_pulling_prometheus_token_file: str | None = Field(
         default_factory=lambda: os.environ.get("PROMETHEUS_TOKEN_FILE"),
         exclude=True,
         description=(
@@ -552,7 +552,7 @@ class PlannerConfig(BaseModel):
             "an injected CA bundle if the upstream uses a private CA."
         ),
     )
-    metric_pulling_prometheus_extra_query_params: Optional[Dict[str, str]] = Field(
+    metric_pulling_prometheus_extra_query_params: dict[str, str] | None = Field(
         default_factory=lambda: (
             dict(
                 parse_qsl(
@@ -569,7 +569,7 @@ class PlannerConfig(BaseModel):
             "e.g. `namespace=my-ns&tenant=foo`."
         ),
     )
-    metric_pulling_prometheus_ca_bundle: Optional[str] = Field(
+    metric_pulling_prometheus_ca_bundle: str | None = Field(
         default_factory=lambda: os.environ.get("PROMETHEUS_CA_BUNDLE"),
         exclude=True,
         validate_default=True,
@@ -599,7 +599,7 @@ class PlannerConfig(BaseModel):
 
     @field_validator("metric_pulling_prometheus_ca_bundle", mode="after")
     @classmethod
-    def _validate_ca_bundle_path(cls, v: Optional[str]) -> Optional[str]:
+    def _validate_ca_bundle_path(cls, v: str | None) -> str | None:
         if v is not None and not Path(v).is_file():
             raise ValueError(
                 f"metric_pulling_prometheus_ca_bundle path does not exist or is not a file: {v!r}. "
@@ -614,10 +614,10 @@ class PlannerConfig(BaseModel):
         "frontend", "router"
     ] = SLAPlannerDefaults.throughput_metrics_source
 
-    model_name: Optional[str] = None
+    model_name: str | None = None
 
     # Global planner environment
-    global_planner_namespace: Optional[str] = None
+    global_planner_namespace: str | None = None
 
     # Scaling mode flags
     enable_throughput_scaling: bool = SLAPlannerDefaults.enable_throughput_scaling
@@ -643,7 +643,7 @@ class PlannerConfig(BaseModel):
     load_scaling_down_sensitivity: int = (
         SLAPlannerDefaults.load_scaling_down_sensitivity
     )
-    prefill_scale_up_queue_tokens: Optional[int] = Field(
+    prefill_scale_up_queue_tokens: int | None = Field(
         default=SLAPlannerDefaults.prefill_scale_up_queue_tokens,
         ge=0,
         description=(
@@ -651,7 +651,7 @@ class PlannerConfig(BaseModel):
             "optimization_target='load'."
         ),
     )
-    prefill_scale_down_queue_tokens: Optional[int] = Field(
+    prefill_scale_down_queue_tokens: int | None = Field(
         default=SLAPlannerDefaults.prefill_scale_down_queue_tokens,
         ge=0,
         description=(
@@ -659,7 +659,7 @@ class PlannerConfig(BaseModel):
             "optimization_target='load'."
         ),
     )
-    decode_scale_up_kv_rate: Optional[float] = Field(
+    decode_scale_up_kv_rate: float | None = Field(
         default=SLAPlannerDefaults.decode_scale_up_kv_rate,
         ge=0,
         le=100,
@@ -669,7 +669,7 @@ class PlannerConfig(BaseModel):
             "optimization_target='load'. Accepts 0-100."
         ),
     )
-    decode_scale_down_kv_rate: Optional[float] = Field(
+    decode_scale_down_kv_rate: float | None = Field(
         default=SLAPlannerDefaults.decode_scale_down_kv_rate,
         ge=0,
         le=100,
@@ -713,7 +713,7 @@ class PlannerConfig(BaseModel):
             "mode='agg'."
         ),
     )
-    total_gpu_power_limit: Optional[int] = Field(
+    total_gpu_power_limit: int | None = Field(
         default=None,
         ge=1,
         description=(
@@ -729,7 +729,7 @@ class PlannerConfig(BaseModel):
     )
 
     # Diagnostics report settings
-    report_interval_hours: Optional[float] = Field(
+    report_interval_hours: float | None = Field(
         default=24.0,
         description=(
             "Generate an HTML diagnostics report every N hours (simulated time). "
@@ -740,7 +740,7 @@ class PlannerConfig(BaseModel):
         default="./planner_reports",
         description="Directory for HTML diagnostics reports.",
     )
-    report_filename: Optional[str] = Field(
+    report_filename: str | None = Field(
         default=None,
         description=(
             "Fixed filename for HTML diagnostics reports. "
@@ -1111,7 +1111,7 @@ class PlannerConfig(BaseModel):
 
         return resolve_min_endpoint(self, "decode")
 
-    def active_min_endpoints(self) -> tuple[Optional[int], Optional[int]]:
+    def active_min_endpoints(self) -> tuple[int | None, int | None]:
         """Return effective ``(prefill, decode)`` floors for the active mode."""
 
         if self.mode == "prefill":
