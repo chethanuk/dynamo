@@ -104,6 +104,7 @@ Signals:
 - manifest applied but no pods appear
 - `DynamoGraphDeployment` has reconcile errors
 - CRD is missing
+- `status.restart.phase` is `Superseded` with a `RestartSuperseded` warning event, or `spec.restart.id` was rejected while a rolling update is `Pending`/`InProgress`
 
 Checks:
 
@@ -111,9 +112,13 @@ Checks:
 kubectl get dynamographdeployment -n "${NAMESPACE}"
 kubectl describe dynamographdeployment <name> -n "${NAMESPACE}"
 kubectl get crd | grep -i dynamo
+# Restart-specific checks
+kubectl get dynamographdeployment <name> -n "${NAMESPACE}" -o jsonpath='{.status.restart}{"\n"}' | python3 -m json.tool
+kubectl get dynamographdeployment <name> -n "${NAMESPACE}" -o jsonpath='{.status.rollingUpdate.phase}{"\n"}'
+kubectl get events -n "${NAMESPACE}" --field-selector reason=RestartSuperseded --sort-by=.lastTimestamp | tail -n 20
 ```
 
-Next action: install/fix Dynamo Kubernetes Platform or repair invalid DGD YAML.
+Next action: install/fix Dynamo Kubernetes Platform or repair invalid DGD YAML. For restarts, see [Restart a DynamoGraphDeployment](../../../docs/fern/pages/kubernetes/operations/restart-dynamo-graph-deployment.mdx) — wait for any `Pending`/`InProgress` rolling update to clear before changing `spec.restart.id`, and re-issue a new `restart.id` after a `Superseded` restart.
 
 ## Frontend Or Router
 

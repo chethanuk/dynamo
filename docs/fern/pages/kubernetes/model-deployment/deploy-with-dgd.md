@@ -748,6 +748,9 @@ These are independent capabilities you opt into per workload. None are required 
   <Card title="Auto Deploy with DGDR" icon="regular wand-magic-sparkles" href="../auto-deployment/auto-deploy-with-dgdr.md">
     Let the Planner pick parallelism and autoscale to an SLA — authored as a DGDR, not a DGD.
   </Card>
+  <Card title="Restart a DynamoGraphDeployment" icon="regular arrows-rotate" href="../operations/restart-dynamo-graph-deployment.mdx">
+    Restart an existing graph in place — issue a new restart ID, choose a rollout strategy, and monitor progress.
+  </Card>
 </CardGroup>
 
 > [!IMPORTANT]

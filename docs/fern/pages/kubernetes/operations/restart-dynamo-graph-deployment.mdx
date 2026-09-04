@@ -1,0 +1,292 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: Restart a DynamoGraphDeployment
+subtitle: Restart a running DynamoGraphDeployment in place — issue a new restart ID, choose a rollout strategy, monitor progress, and recover from admission or Superseded states.
+---
+
+A restart rolls the pods that make up a `DynamoGraphDeployment` (DGD) without changing its spec. Use it to pick up a new runtime image that was mutated in place, to force a clean rollout after a node replacement, or to recover workers that need a fresh start. The request is a single field change — a new `spec.restart.id` — and the operator reconciles it into annotated pod templates, component by component.
+
+This guide covers the full restart lifecycle: prerequisites, issuing the restart, choosing a strategy, monitoring progress, and handling admission rejections or `Superseded` states. For the field definitions, see the [DGD Reference](../../reference/kubernetes-api/dynamo-graph-deployment.mdx).
+
+<Steps toc={true}>
+
+<Step title="Confirm prerequisites">
+
+A DGD must be created **without** `spec.restart`.
+
+```yaml
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: my-graph
+spec:
+  components:
+    - name: frontend
+      type: frontend
+      replicas: 1
+    - name: worker
+      type: worker
+      replicas: 2
+```
+
+The API server rejects `spec.restart` on create:
+
+```text
+spec.restart must be unset on create; set spec.restart.id after creation to request a restart
+```
+
+Set `spec.restart.id` only after the object exists. The DGD must already be reconciled — if you just applied it, wait until the controller has observed the generation:
+
+```bash
+kubectl get dynamographdeployment my-graph -n $NAMESPACE -o jsonpath='{.status.observedGeneration} {.metadata.generation}{"\n"}'
+kubectl wait --for=condition=Ready dynamographdeployment/my-graph -n $NAMESPACE --timeout=600s
+```
+
+A restart also requires no active managed rolling update. If `.status.rollingUpdate.phase` is `Pending` or `InProgress`, the admission webhook rejects a new `spec.restart.id` until the rolling update completes. See [Handle admission rejection](#handle-admission-rejection) below.
+
+</Step>
+
+<Step title="Issue a restart with a new restart ID">
+
+Change `spec.restart.id` to any new, nonempty string. Every change triggers a new restart — the value itself has no semantics, so use a timestamp, a short hash, or a run identifier. Record the value you set; you will correlate it with `.status.restart.observedID`.
+
+Generate a new ID and patch the DGD in one command:
+
+```bash
+RESTART_ID="restart-$(date -u +%Y%m%dT%H%M%SZ)"
+echo "Restart ID: ${RESTART_ID}"
+
+kubectl patch dynamographdeployment my-graph -n $NAMESPACE \
+  --type merge \
+  --patch "{\"spec\":{\"restart\":{\"id\":\"${RESTART_ID}\"}}}"
+```
+
+Or patch with an explicit value:
+
+```bash
+kubectl patch dynamographdeployment my-graph -n $NAMESPACE \
+  --type merge \
+  --patch '{"spec":{"restart":{"id":"restart-1"}}}'
+```
+
+Verify the patch was accepted and the controller has observed it:
+
+```bash
+kubectl get dynamographdeployment my-graph -n $NAMESPACE \
+  -o jsonpath='{.spec.restart.id}{"\n"}'
+
+kubectl get dynamographdeployment my-graph -n $NAMESPACE \
+  -o jsonpath='{.status.restart.observedID} {.status.restart.phase} {.status.restart.inProgress}{"\n"}'
+```
+
+`spec.restart.id` is your intent; `status.restart.observedID` is what the controller is currently acting on. They match when the controller has picked up the new restart. A mismatch means the controller has not reconciled the generation yet.
+
+<Note>
+Do not leave `spec.restart.id` empty. An empty string is rejected by schema validation (`spec.restart.id in body should be at least 1 chars long`). Reusing the same ID does not trigger a new restart — change the string.
+</Note>
+
+</Step>
+
+<Step title="Choose a restart strategy">
+
+Set the strategy in the same patch as the ID when you need to change it. If you omit `strategy`, the controller uses `Sequential`.
+
+<Tabs>
+<Tab title="Sequential (default)">
+
+```bash
+RESTART_ID="restart-$(date -u +%Y%m%dT%H%M%SZ)"
+kubectl patch dynamographdeployment my-graph -n $NAMESPACE \
+  --type merge \
+  --patch "{\"spec\":{\"restart\":{\"id\":\"${RESTART_ID}\",\"strategy\":{\"type\":\"Sequential\"}}}}"
+```
+
+To pin a custom order, provide the complete ordered set of component names. Omit or leave empty to use the controller's default alphabetical order:
+
+```bash
+kubectl patch dynamographdeployment my-graph -n $NAMESPACE \
+  --type merge \
+  --patch '{"spec":{"restart":{"id":"restart-2","strategy":{"type":"Sequential","order":["frontend","worker"]}}}}'
+```
+
+- Components restart **one at a time** in the chosen order (default: alphabetical by component name).
+- The order serializes **components**, not replicas. Replicas inside a single component still roll according to the component's underlying workload (Deployment, PodClique, or Grove PodCliqueSet) and its rollout strategy.
+- No total-outage guarantee is provided. Whether requests stay available during the restart depends on replica count, pod disruption budgets, and the component's rollout strategy, not on the restart strategy alone.
+
+</Tab>
+<Tab title="Parallel">
+
+```bash
+RESTART_ID="restart-$(date -u +%Y%m%dT%H%M%SZ)"
+kubectl patch dynamographdeployment my-graph -n $NAMESPACE \
+  --type merge \
+  --patch "{\"spec\":{\"restart\":{\"id\":\"${RESTART_ID}\",\"strategy\":{\"type\":\"Parallel\"}}}}"
+```
+
+- All components roll **concurrently**. The controller annotates every component's pod template with the same `nvidia.com/restartAt` timestamp at once.
+- This is also not a total-outage guarantee. Concurrent component rollout means more pods may be restarting at the same time, so availability depends on how many replicas stay ready across the graph. For traffic-sensitive restarts, keep enough ready replicas per component or use `Sequential`.
+
+</Tab>
+</Tabs>
+
+Validation rules:
+
+- `order` must contain every component name exactly once, with unique values. A partial, duplicate, or unknown name is rejected.
+- `order` must not be set when `type` is `Parallel` (`spec.restart.strategy.order: Forbidden: cannot be specified when strategy is parallel`).
+
+</Step>
+
+<Step title="Monitor restart progress">
+
+Restart progress lives under `.status.restart`. Poll it and correlate it with pods, events, and the frontend endpoint.
+
+**Restart progress fields**
+
+```bash
+kubectl get dynamographdeployment my-graph -n $NAMESPACE -o jsonpath='{range $k,$v := .status.restart}{{$k}}={{$v}} {"\n"}{end}'
+kubectl get dynamographdeployment my-graph -n $NAMESPACE -o jsonpath='{.status.restart}{"\n"}' | python3 -m json.tool
+```
+
+| Field | Meaning |
+|---|---|
+| `.status.restart.observedID` | The `spec.restart.id` the controller is currently processing. Matches `spec.restart.id` when the restart has been picked up. |
+| `.status.restart.phase` | Phase of the restart: `Pending`, `Restarting`, `Completed`, `Failed`, or `Superseded`. |
+| `.status.restart.inProgress` | Names of the components currently being restarted. Empty when the restart is `Completed`. |
+
+Phases:
+
+- `Pending` / `Restarting` — the controller has accepted the ID and is rolling components. For `Sequential`, `inProgress` holds one component at a time; for `Parallel`, it holds all of them until they are ready.
+- `Completed` — every component has been restarted and become ready.
+- `Failed` — the restart did not complete; inspect component conditions and pod events.
+- `Superseded` — the restart was superseded by a managed rolling update; see [Handle Superseded restarts](#handle-superseded-restarts).
+
+Watch the DGD until it becomes Ready again:
+
+```bash
+kubectl get dynamographdeployment my-graph -n $NAMESPACE -w
+kubectl wait --for=condition=Ready dynamographdeployment/my-graph -n $NAMESPACE --timeout=600s
+```
+
+**Correlate with pods and events**
+
+The controller implements a restart by stamping `nvidia.com/restartAt: "<restart-id>"` on each component's pod template. The underlying workload then rolls its pods. Check which pods carry the new annotation and whether they are ready:
+
+```bash
+kubectl get pods -n $NAMESPACE -l nvidia.com/dynamo-graph-deployment-name=my-graph \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,RESTART_AT:.metadata.annotations."nvidia.com/restartAt"'
+
+kubectl describe dynamographdeployment my-graph -n $NAMESPACE
+kubectl get events -n $NAMESPACE --field-selector involvedObject.kind=DynamoGraphDeployment,involvedObject.name=my-graph --sort-by=.lastTimestamp | tail -n 30
+```
+
+For Grove-backed deployments, the same annotation appears on the generated `PodCliqueSet` pod templates and propagates to the owned `PodClique` objects.
+
+**Correlate with the Ready condition and endpoint health**
+
+`status.conditions[type=Ready].status` stays `False` while a restart or rolling update is in flight. Confirm the frontend stays reachable during the window:
+
+```bash
+kubectl get dynamographdeployment my-graph -n $NAMESPACE \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].reason}{"\n"}'
+
+kubectl port-forward svc/my-graph-frontend 8000:8000 -n $NAMESPACE &
+curl -s http://localhost:8000/health | python3 -m json.tool
+curl -s http://localhost:8000/v1/models | python3 -m json.tool
+```
+
+If the frontend returns 503 or an empty model list while `Ready` is `False`, the graph is not yet fully available. Wait for `Ready=True` before benchmarking.
+
+</Step>
+
+<Step title="Handle admission rejection">
+
+If a cluster has an active **operator-managed rolling update** (for single-node, non-Grove DGDs), its `.status.rollingUpdate.phase` is `Pending` or `InProgress`. While that phase is active, the admission webhook rejects a `spec.restart.id` that differs from the stored value:
+
+```text
+spec.restart.id: Invalid value: "restart-2": cannot be changed while a rolling update is InProgress
+```
+
+This also applies to `Pending`. The error is intentional: a rolling update already owns the replica rollout, and a concurrent restart would contend with it.
+
+Check the rolling update phase:
+
+```bash
+kubectl get dynamographdeployment my-graph -n $NAMESPACE -o jsonpath='{.status.rollingUpdate.phase}{"\n"}'
+kubectl get dynamographdeployment my-graph -n $NAMESPACE -o jsonpath='{.status.rollingUpdate}{"\n"}' | python3 -m json.tool
+```
+
+A new `restart.id` is admissible only after the phase clears — that is, after it becomes `Completed`, `Failed`, or disappears (nil):
+
+```bash
+kubectl wait --for=jsonpath='{.status.rollingUpdate.phase}'=Completed dynamographdeployment/my-graph -n $NAMESPACE --timeout=600s
+# or, if the phase was Failed, resolve the failure first, then retry the patch
+RESTART_ID="restart-$(date -u +%Y%m%dT%H%M%SZ)"
+kubectl patch dynamographdeployment my-graph -n $NAMESPACE \
+  --type merge \
+  --patch "{\"spec\":{\"restart\":{\"id\":\"${RESTART_ID}\"}}}"
+```
+
+Keeping the same `spec.restart.id` while the rolling update is active is allowed — only a change is rejected.
+
+</Step>
+
+<Step title="Handle Superseded restarts">
+
+If you set a new `spec.restart.id` and a managed rolling update starts (or is already `Pending`/`InProgress`) before the restart finishes, the controller marks the restart `Superseded`:
+
+```bash
+kubectl get dynamographdeployment my-graph -n $NAMESPACE -o jsonpath='{.status.restart.phase} {.status.restart.observedID}{"\n"}'
+# Superseded restart-1
+```
+
+What this means:
+
+- `status.restart.phase` becomes `Superseded` and `observedID` stays at the superseded ID.
+- No further restart annotations are pushed for that ID. Existing `nvidia.com/restartAt` annotations already applied to a component are preserved, but the controller does not advance to the next component in a `Sequential` restart.
+- The controller emits a warning event:
+
+```bash
+kubectl get events -n $NAMESPACE --field-selector reason=RestartSuperseded --sort-by=.lastTimestamp
+# Warning RestartSuperseded Restart restart-1 superseded by rolling update
+```
+
+The `RestartSuperseded` event is emitted only once per transition into `Superseded` for a given `observedID`.
+
+Recovery:
+
+1. Wait for the rolling update to finish:
+
+   ```bash
+   kubectl get dynamographdeployment my-graph -n $NAMESPACE -o jsonpath='{.status.rollingUpdate.phase}{"\n"}'
+   ```
+
+2. Issue a **new** `spec.restart.id` to request the restart again. Reusing the superseded ID does not re-trigger it — changing the string is what starts a new restart:
+
+   ```bash
+   RESTART_ID="restart-$(date -u +%Y%m%dT%H%M%SZ)"
+   kubectl patch dynamographdeployment my-graph -n $NAMESPACE \
+     --type merge \
+     --patch "{\"spec\":{\"restart\":{\"id\":\"${RESTART_ID}\"}}}"
+   ```
+
+</Step>
+
+</Steps>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Deploy with DGD" icon="rocket" href="../model-deployment/deploy-with-dgd.md">
+    Author and apply the DynamoGraphDeployment that you will restart.
+  </Card>
+  <Card title="DGD Reference" icon="book" href="../../reference/kubernetes-api/dynamo-graph-deployment.mdx">
+    Field reference for spec.restart, strategy, and status.restart.
+  </Card>
+  <Card title="Full API Reference" icon="code" href="../../reference/kubernetes-api/full-api-reference.mdx">
+    Complete schema for Restart, RestartPhase, and RollingUpdateStatus.
+  </Card>
+  <Card title="Troubleshooting" icon="screwdriver-wrench" href="../../../.agents/skills/troubleshoot-dynamo/references/failure-decision-tree.md">
+    Decision tree for failed or unhealthy deployments.
+  </Card>
+</CardGroup>

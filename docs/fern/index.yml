@@ -227,6 +227,8 @@ navigation:
             path: pages/kubernetes/operations/performance-tuning.md
           - page: LoRA Adapters
             path: pages/kubernetes/operations/lora-adapters.md
+          - page: Restart a DynamoGraphDeployment
+            path: pages/kubernetes/operations/restart-dynamo-graph-deployment.mdx
 
   # ==================== Local Guide ====================
   - tab: cli-guide
