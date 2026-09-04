@@ -118,7 +118,7 @@ kubectl get dynamographdeployment <name> -n "${NAMESPACE}" -o jsonpath='{.status
 kubectl get events -n "${NAMESPACE}" --field-selector reason=RestartSuperseded --sort-by=.lastTimestamp | tail -n 20
 ```
 
-Next action: install/fix Dynamo Kubernetes Platform or repair invalid DGD YAML. For restarts, see [Restart a DynamoGraphDeployment](../../../docs/fern/pages/kubernetes/operations/restart-dynamo-graph-deployment.mdx) — wait for any `Pending`/`InProgress` rolling update to clear before changing `spec.restart.id`, and re-issue a new `restart.id` after a `Superseded` restart.
+Next action: install/fix Dynamo Kubernetes Platform or repair invalid DGD YAML. For restarts, see [Restart a DynamoGraphDeployment](../../../../docs/fern/pages/kubernetes/operations/restart-dynamo-graph-deployment.mdx) — wait for any `Pending`/`InProgress` rolling update to clear before changing `spec.restart.id`, and re-issue a new `restart.id` after a `Superseded` restart.
 
 ## Frontend Or Router
 
